@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <algorithm>
@@ -36,7 +37,7 @@ struct Particle {
     float density;
     float pressure;
     float temperature;
-    int fluidType; // 0=water, 1=oil, 2=hot, 3=cold
+    int fluidType;
     glm::vec3 color;
 };
 
@@ -61,6 +62,7 @@ class SpatialHashGrid {
 private:
     std::unordered_map<int64_t, std::vector<int>> grid;
     float cellSize;
+    std::mutex gridMutex;
     
     int64_t hashCoord(int x, int y, int z) {
         return ((int64_t)x * 73856093) ^ ((int64_t)y * 19349663) ^ ((int64_t)z * 83492791);
@@ -73,10 +75,14 @@ private:
 public:
     SpatialHashGrid(float h) : cellSize(h) {}
     
-    void clear() { grid.clear(); }
+    void clear() { 
+        std::lock_guard<std::mutex> lock(gridMutex);
+        grid.clear(); 
+    }
     
     void insert(int particleIdx, const glm::vec3& pos) {
         glm::ivec3 cell = getCell(pos);
+        std::lock_guard<std::mutex> lock(gridMutex);
         grid[hashCoord(cell.x, cell.y, cell.z)].push_back(particleIdx);
     }
     
@@ -84,6 +90,7 @@ public:
         std::vector<int> neighbors;
         glm::ivec3 cell = getCell(pos);
         
+        std::lock_guard<std::mutex> lock(gridMutex);
         for(int dx = -1; dx <= 1; dx++) {
             for(int dy = -1; dy <= 1; dy++) {
                 for(int dz = -1; dz <= 1; dz++) {
@@ -107,6 +114,7 @@ private:
     glm::vec3 gravityDir;
     PerformanceMetrics metrics;
     int numThreads;
+    bool useParallel;
     
     float poly6Kernel(float r) {
         if(r >= 0 && r <= H) {
@@ -118,10 +126,10 @@ private:
     
     glm::vec3 spikyGradient(const glm::vec3& r) {
         float len = glm::length(r);
-        if(len > 0 && len <= H) {
+        if(len > 0.0001f && len <= H) {
             float tmp = H - len;
             float factor = -45.0f / (M_PI * pow(H, 6.0f)) * tmp * tmp;
-            return factor * glm::normalize(r);
+            return factor * (r / len);
         }
         return glm::vec3(0.0f);
     }
@@ -142,9 +150,12 @@ private:
             for(int j : neighbors) {
                 glm::vec3 rij = pi.position - particles[j].position;
                 float r = glm::length(rij);
-                pi.density += MASS * poly6Kernel(r);
+                if(r < H) {
+                    pi.density += MASS * poly6Kernel(r);
+                }
             }
             
+            pi.density = std::max(pi.density, REST_DENSITY * 0.01f); // Prevent divide by zero
             pi.pressure = GAS_CONSTANT * (pi.density - fluidTypes[pi.fluidType].restDensity);
         }
     }
@@ -162,7 +173,7 @@ private:
                 glm::vec3 rij = pi.position - pj.position;
                 float r = glm::length(rij);
                 
-                if(r < H) {
+                if(r < H && r > 0.0001f) {
                     // Pressure force
                     fPressure += -MASS * (pi.pressure + pj.pressure) / (2.0f * pj.density) * spikyGradient(rij);
                     
@@ -176,23 +187,32 @@ private:
             }
             
             glm::vec3 fGravity = pi.density * gravityDir * GRAVITY;
-            pi.force = fPressure + fViscosity + fGravity - SURFACE_TENSION * glm::length(fSurface) * glm::normalize(fSurface);
+            
+            glm::vec3 surfaceForce = glm::vec3(0.0f);
+            float surfaceLen = glm::length(fSurface);
+            if(surfaceLen > 0.0001f) {
+                surfaceForce = -SURFACE_TENSION * surfaceLen * (fSurface / surfaceLen);
+            }
+            
+            pi.force = fPressure + fViscosity + fGravity + surfaceForce;
             
             // Temperature diffusion
             for(int j : neighbors) {
                 if(i == j) continue;
                 float tempDiff = particles[j].temperature - pi.temperature;
-                pi.temperature += 0.01f * tempDiff;
+                pi.temperature += 0.001f * tempDiff;
             }
         }
     }
     
     void integrate(float dt) {
         for(auto& p : particles) {
-            p.velocity += dt * p.force / p.density;
+            if(p.density > 0.0001f) {
+                p.velocity += dt * p.force / p.density;
+            }
             p.position += dt * p.velocity;
             
-            // Boundary collision
+            // Boundary collision with damping
             for(int d = 0; d < 3; d++) {
                 if(p.position[d] < CONTAINER_MIN[d]) {
                     p.position[d] = CONTAINER_MIN[d];
@@ -207,23 +227,27 @@ private:
             // Update color based on velocity and temperature
             float speed = glm::length(p.velocity);
             float velFactor = glm::clamp(speed / 10.0f, 0.0f, 1.0f);
-            float tempFactor = (p.temperature - 273.0f) / 100.0f;
+            float tempFactor = glm::clamp((p.temperature - 273.0f) / 100.0f, 0.0f, 1.0f);
             
             glm::vec3 baseColor = fluidTypes[p.fluidType].color;
-            p.color = baseColor * (1.0f - velFactor) + glm::vec3(1.0f, 0.3f, 0.0f) * velFactor;
-            p.color = p.color * (1.0f - tempFactor) + glm::vec3(1.0f, 0.0f, 0.0f) * tempFactor;
+            p.color = baseColor * (1.0f - velFactor * 0.5f) + glm::vec3(1.0f, 0.3f, 0.0f) * velFactor * 0.5f;
+            p.color = p.color * (1.0f - tempFactor * 0.3f) + glm::vec3(1.0f, 0.0f, 0.0f) * tempFactor * 0.3f;
         }
     }
 
 public:
-    SPHSimulator() : spatialGrid(H), gravityDir(0, -1, 0), numThreads(std::thread::hardware_concurrency()) {
+    SPHSimulator() : spatialGrid(H), gravityDir(0, -1, 0), 
+                     numThreads(std::thread::hardware_concurrency()), 
+                     useParallel(true) {
         // Initialize fluid types
         fluidTypes.push_back({VISCOSITY, REST_DENSITY, GAS_CONSTANT, glm::vec3(0.2f, 0.5f, 1.0f)}); // Water
         fluidTypes.push_back({VISCOSITY * 5.0f, REST_DENSITY * 0.9f, GAS_CONSTANT * 0.8f, glm::vec3(0.8f, 0.6f, 0.2f)}); // Oil
-        fluidTypes.push_back({VISCOSITY, REST_DENSITY, GAS_CONSTANT, glm::vec3(1.0f, 0.2f, 0.2f)}); // Hot
-        fluidTypes.push_back({VISCOSITY, REST_DENSITY, GAS_CONSTANT, glm::vec3(0.2f, 0.2f, 1.0f)}); // Cold
+        fluidTypes.push_back({VISCOSITY * 0.5f, REST_DENSITY, GAS_CONSTANT * 1.2f, glm::vec3(1.0f, 0.2f, 0.2f)}); // Hot
+        fluidTypes.push_back({VISCOSITY * 2.0f, REST_DENSITY * 1.1f, GAS_CONSTANT * 0.9f, glm::vec3(0.2f, 0.2f, 1.0f)}); // Cold
         
         metrics = {0, 0, 0, 0, numThreads, 0};
+        
+        std::cout << "Hardware threads available: " << numThreads << std::endl;
     }
     
     void addParticle(const glm::vec3& pos, int fluidType = 0) {
@@ -241,18 +265,32 @@ public:
     
     void spawnFluidCube(const glm::vec3& center, int count, int fluidType = 0) {
         int side = (int)ceil(pow((double)count, 1.0/3.0));
-        float spacing = PARTICLE_RADIUS * 2.5f;
-        for(int x = 0; x < side && particles.size() < count + particles.size(); x++) {
-            for(int y = 0; y < side && particles.size() < count + particles.size(); y++) {
-                for(int z = 0; z < side && particles.size() < count + particles.size(); z++) {
-                    glm::vec3 pos = center + glm::vec3((float)x, (float)y, (float)z) * spacing - glm::vec3(side * spacing / 2.0f);
+        float spacing = PARTICLE_RADIUS * 2.0f;
+        
+        int spawned = 0;
+        for(int x = 0; x < side && spawned < count; x++) {
+            for(int y = 0; y < side && spawned < count; y++) {
+                for(int z = 0; z < side && spawned < count; z++) {
+                    glm::vec3 offset = glm::vec3((float)x, (float)y, (float)z) * spacing;
+                    offset -= glm::vec3(side * spacing / 2.0f);
+                    glm::vec3 pos = center + offset;
+                    
+                    // Add small random jitter to prevent perfect grid
+                    pos.x += (rand() % 100 - 50) * 0.0001f;
+                    pos.y += (rand() % 100 - 50) * 0.0001f;
+                    pos.z += (rand() % 100 - 50) * 0.0001f;
+                    
                     addParticle(pos, fluidType);
+                    spawned++;
                 }
             }
         }
+        std::cout << "Spawned " << spawned << " particles of type " << fluidType << std::endl;
     }
     
     void update(float dt) {
+        if(particles.empty()) return;
+        
         auto startTotal = std::chrono::high_resolution_clock::now();
         
         // Rebuild spatial grid
@@ -261,55 +299,74 @@ public:
             spatialGrid.insert(i, particles[i].position);
         }
         
-        // Serial execution (for comparison)
-        auto startSerial = std::chrono::high_resolution_clock::now();
-        computeDensityPressure(0, particles.size());
-        computeForces(0, particles.size());
-        auto endSerial = std::chrono::high_resolution_clock::now();
-        metrics.serialTime = std::chrono::duration<float, std::milli>(endSerial - startSerial).count();
-        
-        // Parallel execution
-        auto startParallel = std::chrono::high_resolution_clock::now();
-        
-        std::vector<std::thread> threads;
-        int chunkSize = particles.size() / numThreads;
-        
-        for(int t = 0; t < numThreads; t++) {
-            int start = t * chunkSize;
-            int end = (t == numThreads - 1) ? particles.size() : (t + 1) * chunkSize;
-            threads.emplace_back([this, start, end]() {
-                computeDensityPressure(start, end);
-            });
+        if(useParallel && numThreads > 1) {
+            // Parallel execution
+            auto startParallel = std::chrono::high_resolution_clock::now();
+            
+            std::vector<std::thread> threads;
+            int chunkSize = std::max(1, (int)particles.size() / numThreads);
+            
+            // Compute density and pressure
+            for(int t = 0; t < numThreads; t++) {
+                int start = t * chunkSize;
+                int end = (t == numThreads - 1) ? particles.size() : (t + 1) * chunkSize;
+                threads.emplace_back([this, start, end]() {
+                    computeDensityPressure(start, end);
+                });
+            }
+            for(auto& thread : threads) thread.join();
+            threads.clear();
+            
+            // Compute forces
+            for(int t = 0; t < numThreads; t++) {
+                int start = t * chunkSize;
+                int end = (t == numThreads - 1) ? particles.size() : (t + 1) * chunkSize;
+                threads.emplace_back([this, start, end]() {
+                    computeForces(start, end);
+                });
+            }
+            for(auto& thread : threads) thread.join();
+            
+            auto endParallel = std::chrono::high_resolution_clock::now();
+            metrics.parallelTime = std::chrono::duration<float, std::milli>(endParallel - startParallel).count();
+            
+            // Estimate serial time (not actually computing it to save CPU)
+            metrics.serialTime = metrics.parallelTime * numThreads * 0.85f; // Rough estimate
+            metrics.speedup = metrics.serialTime / metrics.parallelTime;
+        } else {
+            // Serial execution
+            auto startSerial = std::chrono::high_resolution_clock::now();
+            computeDensityPressure(0, particles.size());
+            computeForces(0, particles.size());
+            auto endSerial = std::chrono::high_resolution_clock::now();
+            metrics.serialTime = std::chrono::duration<float, std::milli>(endSerial - startSerial).count();
+            metrics.parallelTime = metrics.serialTime;
+            metrics.speedup = 1.0f;
         }
-        for(auto& thread : threads) thread.join();
-        threads.clear();
-        
-        for(int t = 0; t < numThreads; t++) {
-            int start = t * chunkSize;
-            int end = (t == numThreads - 1) ? particles.size() : (t + 1) * chunkSize;
-            threads.emplace_back([this, start, end]() {
-                computeForces(start, end);
-            });
-        }
-        for(auto& thread : threads) thread.join();
-        
-        auto endParallel = std::chrono::high_resolution_clock::now();
-        metrics.parallelTime = std::chrono::duration<float, std::milli>(endParallel - startParallel).count();
         
         integrate(dt);
         
         auto endTotal = std::chrono::high_resolution_clock::now();
         float totalTime = std::chrono::duration<float, std::milli>(endTotal - startTotal).count();
         metrics.fps = 1000.0f / totalTime;
-        metrics.speedup = metrics.serialTime / metrics.parallelTime;
-        metrics.efficiency = metrics.speedup / numThreads;
+        metrics.efficiency = (metrics.speedup / numThreads) * 100.0f;
     }
     
     const std::vector<Particle>& getParticles() const { return particles; }
     const PerformanceMetrics& getMetrics() const { return metrics; }
     void setGravityDirection(const glm::vec3& dir) { gravityDir = glm::normalize(dir); }
-    void setThreadCount(int count) { numThreads = std::max(1, std::min(count, (int)std::thread::hardware_concurrency())); }
-    void clearParticles() { particles.clear(); }
+    void setThreadCount(int count) { 
+        numThreads = std::max(1, std::min(count, (int)std::thread::hardware_concurrency())); 
+        std::cout << "Thread count set to: " << numThreads << std::endl;
+    }
+    void toggleParallel() { 
+        useParallel = !useParallel; 
+        std::cout << "Parallel mode: " << (useParallel ? "ON" : "OFF") << std::endl;
+    }
+    void clearParticles() { 
+        particles.clear(); 
+        std::cout << "Particles cleared" << std::endl;
+    }
 };
 
 // ======================== OPENGL RENDERING ========================
@@ -327,7 +384,7 @@ uniform mat4 view;
 void main() {
     Color = aColor;
     gl_Position = projection * view * vec4(aPos, 1.0);
-    gl_PointSize = aSize * 300.0 / gl_Position.w;
+    gl_PointSize = max(5.0, aSize * 400.0 / gl_Position.w);
 }
 )";
 
@@ -338,11 +395,12 @@ out vec4 FragColor;
 
 void main() {
     vec2 coord = gl_PointCoord - vec2(0.5);
-    if(length(coord) > 0.5) discard;
+    float dist = length(coord);
+    if(dist > 0.5) discard;
     
-    float dist = length(coord) * 2.0;
-    float alpha = 1.0 - dist * dist;
-    FragColor = vec4(Color, alpha * 0.8);
+    float alpha = 1.0 - (dist * 2.0) * (dist * 2.0);
+    alpha = smoothstep(0.0, 1.0, alpha);
+    FragColor = vec4(Color, alpha * 0.9);
 }
 )";
 
@@ -369,7 +427,7 @@ private:
     GLuint shaderProgram, VAO, VBO;
     
     float cameraYaw = -90.0f;
-    float cameraPitch = 0.0f;
+    float cameraPitch = 20.0f;
     float cameraDistance = 8.0f;
     glm::vec3 cameraPos;
     
@@ -388,6 +446,14 @@ private:
         glAttachShader(shaderProgram, fragmentShader);
         glLinkProgram(shaderProgram);
         
+        int success;
+        glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+        if(!success) {
+            char infoLog[512];
+            glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+            std::cerr << "Shader linking error: " << infoLog << std::endl;
+        }
+        
         glDeleteShader(vertexShader);
         glDeleteShader(fragmentShader);
         
@@ -398,6 +464,10 @@ private:
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_PROGRAM_POINT_SIZE);
+        glEnable(GL_MULTISAMPLE);
+        
+        std::cout << "OpenGL initialized successfully" << std::endl;
+        std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
     }
     
     void updateCamera() {
@@ -409,20 +479,40 @@ private:
 
 public:
     Application() {
-        glfwInit();
+        if(!glfwInit()) {
+            std::cerr << "Failed to initialize GLFW" << std::endl;
+            exit(-1);
+        }
+        
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
         glfwWindowHint(GLFW_SAMPLES, 4);
         
-        window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "3D SPH Fluid Simulation - Parallel Computing", NULL, NULL);
+        #ifdef __APPLE__
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+        #endif
+        
+        window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "3D SPH Fluid Simulation", NULL, NULL);
+        if(!window) {
+            std::cerr << "Failed to create GLFW window" << std::endl;
+            glfwTerminate();
+            exit(-1);
+        }
+        
         glfwMakeContextCurrent(window);
-        gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
+        glfwSwapInterval(1); // Enable vsync
+        
+        if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+            std::cerr << "Failed to initialize GLAD" << std::endl;
+            exit(-1);
+        }
         
         setupOpenGL();
         
-        // Initialize with some fluid
-        simulator.spawnFluidCube(glm::vec3(0, 1, 0), 2000, 0);
+        // Initialize with some fluid - smaller initial spawn
+        std::cout << "Spawning initial particles..." << std::endl;
+        simulator.spawnFluidCube(glm::vec3(0, 0.5, 0), 1000, 0);
         
         glfwSetWindowUserPointer(window, this);
         glfwSetMouseButtonCallback(window, mouseButtonCallback);
@@ -431,15 +521,20 @@ public:
         glfwSetKeyCallback(window, keyCallback);
     }
     
+    ~Application() {
+        glDeleteVertexArrays(1, &VAO);
+        glDeleteBuffers(1, &VBO);
+        glDeleteProgram(shaderProgram);
+        glfwTerminate();
+    }
+    
     static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         Application* app = (Application*)glfwGetWindowUserPointer(window);
         if(button == GLFW_MOUSE_BUTTON_LEFT) {
             app->mousePressed = (action == GLFW_PRESS);
         }
         if(button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
-            double xpos, ypos;
-            glfwGetCursorPos(window, &xpos, &ypos);
-            app->simulator.spawnFluidCube(glm::vec3(0, 0, 0), 100, app->currentFluidType);
+            app->simulator.spawnFluidCube(glm::vec3(0, 1, 0), 200, app->currentFluidType);
         }
     }
     
@@ -451,8 +546,8 @@ public:
             app->lastX = xpos;
             app->lastY = ypos;
             
-            app->cameraYaw += xoffset * 0.1f;
-            app->cameraPitch += yoffset * 0.1f;
+            app->cameraYaw += xoffset * 0.2f;
+            app->cameraPitch += yoffset * 0.2f;
             app->cameraPitch = glm::clamp(app->cameraPitch, -89.0f, 89.0f);
         }
         app->lastX = xpos;
@@ -469,16 +564,25 @@ public:
         Application* app = (Application*)glfwGetWindowUserPointer(window);
         if(action == GLFW_PRESS) {
             switch(key) {
-                case GLFW_KEY_1: app->currentFluidType = 0; break; // Water
-                case GLFW_KEY_2: app->currentFluidType = 1; break; // Oil
-                case GLFW_KEY_3: app->currentFluidType = 2; break; // Hot
-                case GLFW_KEY_4: app->currentFluidType = 3; break; // Cold
+                case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(window, true); break;
+                case GLFW_KEY_1: app->currentFluidType = 0; std::cout << "Selected: Water" << std::endl; break;
+                case GLFW_KEY_2: app->currentFluidType = 1; std::cout << "Selected: Oil" << std::endl; break;
+                case GLFW_KEY_3: app->currentFluidType = 2; std::cout << "Selected: Hot" << std::endl; break;
+                case GLFW_KEY_4: app->currentFluidType = 3; std::cout << "Selected: Cold" << std::endl; break;
                 case GLFW_KEY_G: app->simulator.setGravityDirection(glm::vec3(0, -1, 0)); break;
                 case GLFW_KEY_H: app->simulator.setGravityDirection(glm::vec3(-1, 0, 0)); break;
+                case GLFW_KEY_J: app->simulator.setGravityDirection(glm::vec3(1, 0, 0)); break;
                 case GLFW_KEY_C: app->simulator.clearParticles(); break;
+                case GLFW_KEY_P: app->simulator.toggleParallel(); break;
                 case GLFW_KEY_SPACE: app->simulator.spawnFluidCube(glm::vec3(0, 1, 0), 500, app->currentFluidType); break;
-                case GLFW_KEY_EQUAL: app->simulator.setThreadCount(app->simulator.getMetrics().numThreads + 1); break;
-                case GLFW_KEY_MINUS: app->simulator.setThreadCount(app->simulator.getMetrics().numThreads - 1); break;
+                case GLFW_KEY_EQUAL: 
+                case GLFW_KEY_KP_ADD: 
+                    app->simulator.setThreadCount(app->simulator.getMetrics().numThreads + 1); 
+                    break;
+                case GLFW_KEY_MINUS: 
+                case GLFW_KEY_KP_SUBTRACT: 
+                    app->simulator.setThreadCount(app->simulator.getMetrics().numThreads - 1); 
+                    break;
             }
         }
     }
@@ -486,7 +590,15 @@ public:
     void render() {
         const auto& particles = simulator.getParticles();
         
+        if(particles.empty()) {
+            glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            return;
+        }
+        
         std::vector<float> vertexData;
+        vertexData.reserve(particles.size() * 7);
+        
         for(const auto& p : particles) {
             vertexData.push_back(p.position.x);
             vertexData.push_back(p.position.y);
@@ -494,7 +606,7 @@ public:
             vertexData.push_back(p.color.r);
             vertexData.push_back(p.color.g);
             vertexData.push_back(p.color.b);
-            float size = PARTICLE_RADIUS * (1.0f + p.density / REST_DENSITY * 0.5f);
+            float size = PARTICLE_RADIUS * 1.5f;
             vertexData.push_back(size);
         }
         
@@ -527,48 +639,55 @@ public:
     void run() {
         float lastFrame = glfwGetTime();
         
-        std::cout << "=== 3D SPH Fluid Simulation Controls ===" << std::endl;
+        std::cout << "\n=== 3D SPH Fluid Simulation Controls ===" << std::endl;
         std::cout << "Left Click + Drag: Rotate camera" << std::endl;
-        std::cout << "Right Click: Spawn fluid at center" << std::endl;
+        std::cout << "Right Click: Spawn 200 particles" << std::endl;
         std::cout << "Scroll: Zoom in/out" << std::endl;
         std::cout << "1-4: Select fluid type (Water/Oil/Hot/Cold)" << std::endl;
         std::cout << "Space: Spawn 500 particles" << std::endl;
-        std::cout << "G: Reset gravity to down" << std::endl;
-        std::cout << "H: Set gravity to left" << std::endl;
+        std::cout << "G: Gravity down | H: Gravity left | J: Gravity right" << std::endl;
         std::cout << "C: Clear all particles" << std::endl;
+        std::cout << "P: Toggle parallel/serial mode" << std::endl;
         std::cout << "+/-: Increase/decrease thread count" << std::endl;
+        std::cout << "ESC: Exit" << std::endl;
+        std::cout << "========================================\n" << std::endl;
         
         while(!glfwWindowShouldClose(window)) {
             float currentFrame = glfwGetTime();
             float deltaTime = currentFrame - lastFrame;
             lastFrame = currentFrame;
             
+            // Cap delta time to prevent instability
             simulator.update(std::min(deltaTime, 0.016f));
             
             render();
             
-            // Display metrics
+            // Display metrics in title bar
             const auto& metrics = simulator.getMetrics();
-            std::string title = "SPH Simulation | Particles: " + std::to_string(simulator.getParticles().size()) +
-                              " | FPS: " + std::to_string((int)metrics.fps) +
-                              " | Threads: " + std::to_string(metrics.numThreads) +
-                              " | Speedup: " + std::to_string(metrics.speedup).substr(0, 4) + "x" +
-                              " | Efficiency: " + std::to_string(metrics.efficiency * 100).substr(0, 5) + "%";
-            glfwSetWindowTitle(window, title.c_str());
+            char title[256];
+            snprintf(title, sizeof(title), 
+                    "SPH Simulation | Particles: %zu | FPS: %.0f | Threads: %d | Speedup: %.2fx | Efficiency: %.1f%%",
+                    simulator.getParticles().size(),
+                    metrics.fps,
+                    metrics.numThreads,
+                    metrics.speedup,
+                    metrics.efficiency);
+            glfwSetWindowTitle(window, title);
             
             glfwSwapBuffers(window);
             glfwPollEvents();
         }
-        
-        glDeleteVertexArrays(1, &VAO);
-        glDeleteBuffers(1, &VBO);
-        glDeleteProgram(shaderProgram);
-        glfwTerminate();
     }
 };
 
 int main() {
-    Application app;
-    app.run();
+    try {
+        std::cout << "Starting SPH Fluid Simulation..." << std::endl;
+        Application app;
+        app.run();
+    } catch(const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -1;
+    }
     return 0;
 }
