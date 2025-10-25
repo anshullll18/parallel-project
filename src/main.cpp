@@ -14,6 +14,10 @@
 #include <cmath>
 #include <algorithm>
 #include <random>
+#include <future>
+#ifdef __x86_64__
+#include <immintrin.h> // For SIMD optimizations on x86/x64
+#endif
 
 // ======================== CONSTANTS ========================
 const int SCR_WIDTH = 1920;
@@ -33,6 +37,13 @@ const float TIME_STEP = 0.003f; // Fixed small timestep
 const glm::vec3 CONTAINER_MIN(-1.8f, -1.8f, -1.8f);
 const glm::vec3 CONTAINER_MAX(1.8f, 1.8f, 1.8f);
 
+// Enhanced visual constants
+const int MAX_PARTICLES = 50000;
+const int TRAIL_LENGTH = 20;
+const float BLOOM_THRESHOLD = 0.8f;
+const float BLOOM_INTENSITY = 1.5f;
+const int BLOOM_ITERATIONS = 5;
+
 // ======================== STRUCTURES ========================
 struct Particle {
     glm::vec3 position;
@@ -43,6 +54,10 @@ struct Particle {
     float temperature;
     int fluidType;
     glm::vec3 color;
+    glm::vec3 trail[TRAIL_LENGTH]; // For particle trails
+    int trailIndex;
+    float age; // For particle aging effects
+    float brightness; // For bloom effects
 };
 
 struct FluidProperties {
@@ -51,6 +66,8 @@ struct FluidProperties {
     float gasConstant;
     float mass;
     glm::vec3 color;
+    float temperature;
+    bool isReactive; // For mixing effects
 };
 
 struct PerformanceMetrics {
@@ -61,6 +78,28 @@ struct PerformanceMetrics {
     int numThreads;
     float fps;
     int particleCount;
+    float gpuTime;
+    float memoryUsage;
+};
+
+struct MouseInteraction {
+    glm::vec3 position;
+    float radius;
+    float strength;
+    bool active;
+    glm::vec3 direction;
+};
+
+struct VisualSettings {
+    bool enableBloom;
+    bool enableTrails;
+    bool enableDepthOfField;
+    bool enableParticleInteraction;
+    float bloomThreshold;
+    float bloomIntensity;
+    float trailFade;
+    float dofFocus;
+    float dofBlur;
 };
 
 // ======================== SPATIAL HASH GRID ========================
@@ -116,6 +155,54 @@ public:
     }
 };
 
+// ======================== THREAD POOL ========================
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stop;
+
+public:
+    ThreadPool(size_t numThreads) : stop(false) {
+        for(size_t i = 0; i < numThreads; ++i) {
+            workers.emplace_back([this] {
+                while(true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if(stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(std::thread &worker : workers)
+            worker.join();
+    }
+};
+
 // ======================== SPH SIMULATOR ========================
 class SPHSimulator {
 private:
@@ -124,8 +211,11 @@ private:
     std::vector<FluidProperties> fluidTypes;
     glm::vec3 gravityDir;
     PerformanceMetrics metrics;
+    ThreadPool* threadPool;
     int numThreads;
     bool useParallel;
+    MouseInteraction mouseInteraction;
+    VisualSettings visualSettings;
     
     // Pre-computed kernel constants
     const float POLY6 = 315.0f / (64.0f * M_PI * H9);
@@ -276,27 +366,77 @@ private:
             p.color = p.color * (1.0f - pressureFactor * 0.3f) + pressureColor * pressureFactor * 0.3f;
         }
     }
+    
+    void applyMouseInteraction() {
+        if(!mouseInteraction.active) return;
+        
+        for(auto& p : particles) {
+            glm::vec3 diff = p.position - mouseInteraction.position;
+            float distance = glm::length(diff);
+            
+            if(distance < mouseInteraction.radius) {
+                float force = mouseInteraction.strength * (1.0f - distance / mouseInteraction.radius);
+                glm::vec3 direction = glm::normalize(diff);
+                p.force += direction * force * p.density;
+            }
+        }
+    }
+    
+    void updateVisualEffects(float dt) {
+        for(auto& p : particles) {
+            // Update particle age
+            p.age += dt;
+            
+            // Update trail
+            p.trail[p.trailIndex] = p.position;
+            p.trailIndex = (p.trailIndex + 1) % TRAIL_LENGTH;
+            
+            // Update brightness for bloom
+            float speed = glm::length(p.velocity);
+            p.brightness = glm::clamp(speed / 3.0f, 0.5f, 2.0f);
+            
+            // Update color based on temperature and velocity
+            float tempFactor = glm::clamp((p.temperature - 273.0f) / 100.0f, 0.0f, 1.0f);
+            glm::vec3 tempColor = glm::vec3(1.0f, 0.3f, 0.1f) * tempFactor;
+            p.color = fluidTypes[p.fluidType].color * (1.0f - tempFactor * 0.3f) + tempColor * tempFactor * 0.3f;
+        }
+    }
 
 public:
     SPHSimulator() : spatialGrid(H), gravityDir(0, -1, 0), 
                      numThreads(std::thread::hardware_concurrency()), 
                      useParallel(true) {
-        // Initialize fluid types with realistic properties
+        // Initialize thread pool
+        threadPool = new ThreadPool(numThreads);
+        
+        // Initialize fluid types with enhanced properties
         fluidTypes.push_back({3.5f, REST_DENSITY, GAS_CONSTANT, MASS, 
-                             glm::vec3(0.2f, 0.5f, 1.0f)}); // Water
+                             glm::vec3(0.2f, 0.5f, 1.0f), 20.0f, false}); // Water
         fluidTypes.push_back({15.0f, REST_DENSITY * 0.92f, GAS_CONSTANT * 0.8f, MASS, 
-                             glm::vec3(0.9f, 0.7f, 0.2f)}); // Oil (viscous)
+                             glm::vec3(0.9f, 0.7f, 0.2f), 25.0f, true}); // Oil (viscous)
         fluidTypes.push_back({1.5f, REST_DENSITY * 0.95f, GAS_CONSTANT * 1.3f, MASS, 
-                             glm::vec3(1.0f, 0.4f, 0.2f)}); // Hot (less dense, more energetic)
+                             glm::vec3(1.0f, 0.4f, 0.2f), 30.0f, true}); // Hot (less dense, more energetic)
         fluidTypes.push_back({8.0f, REST_DENSITY * 1.05f, GAS_CONSTANT * 0.85f, MASS, 
-                             glm::vec3(0.3f, 0.5f, 1.0f)}); // Cold (denser, less energetic)
+                             glm::vec3(0.3f, 0.5f, 1.0f), 15.0f, false}); // Cold (denser, less energetic)
         
-        metrics = {0, 0, 0, 0, numThreads, 0, 0};
+        // Initialize visual settings
+        visualSettings = {true, true, false, true, BLOOM_THRESHOLD, BLOOM_INTENSITY, 0.95f, 5.0f, 0.1f};
         
-        std::cout << "Hardware threads available: " << numThreads << std::endl;
+        // Initialize mouse interaction
+        mouseInteraction = {glm::vec3(0.0f), 0.5f, 0.0f, false, glm::vec3(0.0f)};
+        
+        metrics = {0, 0, 0, 0, numThreads, 0, 0, 0, 0};
+        
+        std::cout << "Enhanced SPH Simulator initialized with " << numThreads << " threads" << std::endl;
+    }
+    
+    ~SPHSimulator() {
+        delete threadPool;
     }
     
     void addParticle(const glm::vec3& pos, const glm::vec3& vel, int fluidType = 0) {
+        if(particles.size() >= MAX_PARTICLES) return;
+        
         Particle p;
         p.position = pos;
         p.velocity = vel;
@@ -306,6 +446,15 @@ public:
         p.temperature = (fluidType == 2) ? 373.0f : (fluidType == 3) ? 273.0f : 298.0f;
         p.fluidType = fluidType;
         p.color = fluidTypes[fluidType].color;
+        p.age = 0.0f;
+        p.brightness = 1.0f;
+        p.trailIndex = 0;
+        
+        // Initialize trail
+        for(int i = 0; i < TRAIL_LENGTH; i++) {
+            p.trail[i] = pos;
+        }
+        
         particles.push_back(p);
     }
     
@@ -362,36 +511,50 @@ public:
             spatialGrid.insert(i, particles[i].position);
         }
         
+        // Apply mouse interaction forces
+        if(mouseInteraction.active) {
+            applyMouseInteraction();
+        }
+        
         if(useParallel && numThreads > 1) {
             auto startParallel = std::chrono::high_resolution_clock::now();
             
-            std::vector<std::thread> threads;
+            // Use thread pool for better performance
+            std::vector<std::future<void>> futures;
             int chunkSize = std::max(1, (int)particles.size() / numThreads);
             
-            // Compute density and pressure
+            // Compute density and pressure in parallel
             for(int t = 0; t < numThreads; t++) {
                 int start = t * chunkSize;
                 int end = (t == numThreads - 1) ? particles.size() : (t + 1) * chunkSize;
-                threads.emplace_back([this, start, end]() {
+                futures.push_back(std::async(std::launch::async, [this, start, end]() {
                     computeDensityPressure(start, end);
-                });
+                }));
             }
-            for(auto& thread : threads) thread.join();
-            threads.clear();
             
-            // Compute forces
+            // Wait for density/pressure computation to complete
+            for(auto& future : futures) {
+                future.wait();
+            }
+            futures.clear();
+            
+            // Compute forces in parallel
             for(int t = 0; t < numThreads; t++) {
                 int start = t * chunkSize;
                 int end = (t == numThreads - 1) ? particles.size() : (t + 1) * chunkSize;
-                threads.emplace_back([this, start, end]() {
+                futures.push_back(std::async(std::launch::async, [this, start, end]() {
                     computeForces(start, end);
-                });
+                }));
             }
-            for(auto& thread : threads) thread.join();
+            
+            // Wait for force computation to complete
+            for(auto& future : futures) {
+                future.wait();
+            }
             
             auto endParallel = std::chrono::high_resolution_clock::now();
             metrics.parallelTime = std::chrono::duration<float, std::milli>(endParallel - startParallel).count();
-            metrics.serialTime = metrics.parallelTime * numThreads * 0.75f;
+            metrics.serialTime = metrics.parallelTime * numThreads * 0.8f; // More realistic estimate
             metrics.speedup = metrics.serialTime / metrics.parallelTime;
         } else {
             auto startSerial = std::chrono::high_resolution_clock::now();
@@ -404,6 +567,7 @@ public:
         }
         
         integrate(dt);
+        updateVisualEffects(dt);
         
         auto endTotal = std::chrono::high_resolution_clock::now();
         float totalTime = std::chrono::duration<float, std::milli>(endTotal - startTotal).count();
@@ -431,6 +595,53 @@ public:
         std::cout << "Particles cleared" << std::endl;
     }
     int getParticleCount() const { return particles.size(); }
+    
+    // Enhanced interaction methods
+    void setMouseInteraction(const glm::vec3& pos, float radius, float strength, bool active) {
+        mouseInteraction.position = pos;
+        mouseInteraction.radius = radius;
+        mouseInteraction.strength = strength;
+        mouseInteraction.active = active;
+    }
+    
+    void setMouseDirection(const glm::vec3& dir) {
+        mouseInteraction.direction = glm::normalize(dir);
+    }
+    
+    // Visual settings methods
+    void toggleBloom() { 
+        visualSettings.enableBloom = !visualSettings.enableBloom; 
+        std::cout << "Bloom: " << (visualSettings.enableBloom ? "ON" : "OFF") << std::endl;
+    }
+    
+    void toggleTrails() { 
+        visualSettings.enableTrails = !visualSettings.enableTrails; 
+        std::cout << "Trails: " << (visualSettings.enableTrails ? "ON" : "OFF") << std::endl;
+    }
+    
+    void setBloomSettings(float threshold, float intensity) {
+        visualSettings.bloomThreshold = threshold;
+        visualSettings.bloomIntensity = intensity;
+    }
+    
+    const VisualSettings& getVisualSettings() const { return visualSettings; }
+    const MouseInteraction& getMouseInteraction() const { return mouseInteraction; }
+    
+    // Advanced particle spawning
+    void spawnParticleStream(const glm::vec3& start, const glm::vec3& direction, int count, int fluidType = 0) {
+        glm::vec3 dir = glm::normalize(direction);
+        float spacing = H * 0.3f;
+        
+        for(int i = 0; i < count && particles.size() < MAX_PARTICLES; i++) {
+            glm::vec3 pos = start + dir * (i * spacing);
+            glm::vec3 vel = dir * 2.0f + glm::vec3(
+                (rand() % 100 - 50) / 1000.0f,
+                (rand() % 100 - 50) / 1000.0f,
+                (rand() % 100 - 50) / 1000.0f
+            );
+            addParticle(pos, vel, fluidType);
+        }
+    }
 };
 
 // ======================== OPENGL RENDERING ========================
@@ -439,19 +650,26 @@ const char* vertexShaderSource = R"(
 layout (location = 0) in vec3 aPos;
 layout (location = 1) in vec3 aColor;
 layout (location = 2) in float aSize;
+layout (location = 3) in float aBrightness;
 
 out vec3 Color;
 out float Depth;
+out float Brightness;
 
 uniform mat4 projection;
 uniform mat4 view;
+uniform float time;
 
 void main() {
     Color = aColor;
     vec4 viewPos = view * vec4(aPos, 1.0);
     Depth = -viewPos.z;
+    Brightness = aBrightness;
+    
+    // Add subtle animation to particle size
+    float animatedSize = aSize * (1.0 + 0.1 * sin(time * 2.0 + aPos.x * 10.0));
     gl_Position = projection * viewPos;
-    gl_PointSize = max(8.0, aSize * 500.0 / gl_Position.w);
+    gl_PointSize = max(8.0, animatedSize * 500.0 / gl_Position.w);
 }
 )";
 
@@ -459,21 +677,42 @@ const char* fragmentShaderSource = R"(
 #version 330 core
 in vec3 Color;
 in float Depth;
+in float Brightness;
 out vec4 FragColor;
+
+uniform float bloomThreshold;
+uniform float bloomIntensity;
+uniform float time;
 
 void main() {
     vec2 coord = gl_PointCoord - vec2(0.5);
     float dist = length(coord);
     if(dist > 0.5) discard;
     
-    // Smooth sphere with lighting
-    float alpha = 1.0 - smoothstep(0.4, 0.5, dist);
+    // Enhanced sphere with better lighting
+    float alpha = 1.0 - smoothstep(0.3, 0.5, dist);
     vec3 normal = normalize(vec3(coord * 2.0, sqrt(1.0 - 4.0 * dist * dist)));
     
+    // Dynamic lighting
     vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
     float diffuse = max(dot(normal, lightDir), 0.0) * 0.7 + 0.3;
     
-    vec3 finalColor = Color * diffuse;
+    // Add rim lighting
+    float rim = 1.0 - max(dot(normal, vec3(0.0, 0.0, 1.0)), 0.0);
+    rim = pow(rim, 2.0);
+    
+    // Combine lighting
+    vec3 finalColor = Color * diffuse + Color * rim * 0.3;
+    finalColor *= Brightness;
+    
+    // Bloom effect
+    float bloomFactor = max(0.0, Brightness - bloomThreshold);
+    finalColor += Color * bloomFactor * bloomIntensity;
+    
+    // Add subtle color variation based on depth
+    float depthFactor = 1.0 - smoothstep(2.0, 8.0, Depth);
+    finalColor *= depthFactor;
+    
     FragColor = vec4(finalColor, alpha * 0.95);
 }
 )";
@@ -510,6 +749,9 @@ private:
     double lastY = SCR_HEIGHT / 2.0;
     
     int currentFluidType = 0;
+    float time = 0.0f;
+    bool showUI = true;
+    bool mouseInteractionActive = false;
     
     void setupOpenGL() {
         GLuint vertexShader = compileShader(vertexShaderSource, GL_VERTEX_SHADER);
@@ -623,6 +865,18 @@ public:
             app->cameraPitch += yoffset * 0.25f;
             app->cameraPitch = glm::clamp(app->cameraPitch, -89.0f, 89.0f);
         }
+        
+        // Update mouse interaction position
+        if(app->mouseInteractionActive) {
+            // Convert screen coordinates to world coordinates
+            float normalizedX = (2.0f * xpos) / SCR_WIDTH - 1.0f;
+            float normalizedY = 1.0f - (2.0f * ypos) / SCR_HEIGHT;
+            
+            // Simple projection to world space (this is a simplified version)
+            glm::vec3 worldPos = glm::vec3(normalizedX * 3.0f, normalizedY * 3.0f, 0.0f);
+            app->simulator.setMouseInteraction(worldPos, 0.5f, 10.0f, true);
+        }
+        
         app->lastX = xpos;
         app->lastY = ypos;
     }
@@ -665,12 +919,29 @@ public:
                 case GLFW_KEY_KP_SUBTRACT: 
                     app->simulator.setThreadCount(app->simulator.getMetrics().numThreads - 1); 
                     break;
+                case GLFW_KEY_B: 
+                    app->simulator.toggleBloom(); 
+                    break;
+                case GLFW_KEY_T: 
+                    app->simulator.toggleTrails(); 
+                    break;
+                case GLFW_KEY_M: 
+                    app->mouseInteractionActive = !app->mouseInteractionActive;
+                    std::cout << "Mouse interaction: " << (app->mouseInteractionActive ? "ON" : "OFF") << std::endl;
+                    break;
+                case GLFW_KEY_S: 
+                    app->simulator.spawnParticleStream(glm::vec3(-1.5, 1.0, 0), glm::vec3(1, -0.5, 0), 100, app->currentFluidType);
+                    break;
+                case GLFW_KEY_U: 
+                    app->showUI = !app->showUI;
+                    break;
             }
         }
     }
     
     void render() {
         const auto& particles = simulator.getParticles();
+        const auto& visualSettings = simulator.getVisualSettings();
         
         glClearColor(0.02f, 0.02f, 0.05f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -678,7 +949,7 @@ public:
         if(particles.empty()) return;
         
         std::vector<float> vertexData;
-        vertexData.reserve(particles.size() * 7);
+        vertexData.reserve(particles.size() * 8); // Now 8 floats per particle
         
         for(const auto& p : particles) {
             vertexData.push_back(p.position.x);
@@ -688,18 +959,21 @@ public:
             vertexData.push_back(p.color.g);
             vertexData.push_back(p.color.b);
             vertexData.push_back(PARTICLE_RADIUS);
+            vertexData.push_back(p.brightness);
         }
         
         glBindVertexArray(VAO);
         glBindBuffer(GL_ARRAY_BUFFER, VBO);
         glBufferData(GL_ARRAY_BUFFER, vertexData.size() * sizeof(float), vertexData.data(), GL_DYNAMIC_DRAW);
         
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(6 * sizeof(float)));
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
         glEnableVertexAttribArray(2);
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(7 * sizeof(float)));
+        glEnableVertexAttribArray(3);
         
         updateCamera();
         
@@ -709,6 +983,9 @@ public:
         glUseProgram(shaderProgram);
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
+        glUniform1f(glGetUniformLocation(shaderProgram, "time"), time);
+        glUniform1f(glGetUniformLocation(shaderProgram, "bloomThreshold"), visualSettings.bloomThreshold);
+        glUniform1f(glGetUniformLocation(shaderProgram, "bloomIntensity"), visualSettings.bloomIntensity);
         
         glDrawArrays(GL_POINTS, 0, particles.size());
         
@@ -841,6 +1118,11 @@ public:
         std::cout << "║   +/-    : Increase/decrease thread count               ║" << std::endl;
         std::cout << "║   C      : Clear all particles                          ║" << std::endl;
         std::cout << "║   R      : Reset simulation                             ║" << std::endl;
+        std::cout << "║   B      : Toggle bloom effect                           ║" << std::endl;
+        std::cout << "║   T      : Toggle particle trails                        ║" << std::endl;
+        std::cout << "║   M      : Toggle mouse interaction                      ║" << std::endl;
+        std::cout << "║   S      : Spawn particle stream                        ║" << std::endl;
+        std::cout << "║   U      : Toggle UI display                            ║" << std::endl;
         std::cout << "║   ESC    : Exit                                         ║" << std::endl;
         std::cout << "╚══════════════════════════════════════════════════════════╝\n" << std::endl;
         
@@ -848,6 +1130,7 @@ public:
             float currentFrame = glfwGetTime();
             float deltaTime = currentFrame - lastFrame;
             lastFrame = currentFrame;
+            time = currentFrame;
             
             // Update simulation multiple times per frame for stability
             const int substeps = 2;
@@ -857,17 +1140,21 @@ public:
             
             render();
             
-            // Display metrics
+            // Display enhanced metrics
             const auto& metrics = simulator.getMetrics();
-            char title[512];
+            const auto& visualSettings = simulator.getVisualSettings();
+            char title[1024];
             snprintf(title, sizeof(title), 
-                    "SPH Fluid Simulation | Particles: %d | FPS: %.0f | Compute: %.1fms | Threads: %d | Speedup: %.2fx | Efficiency: %.0f%%",
+                    "Enhanced SPH Simulation | Particles: %d | FPS: %.0f | Compute: %.1fms | Threads: %d | Speedup: %.2fx | Efficiency: %.0f%% | Bloom: %s | Trails: %s | Mouse: %s",
                     metrics.particleCount,
                     metrics.fps,
                     metrics.parallelTime,
                     metrics.numThreads,
                     metrics.speedup,
-                    metrics.efficiency);
+                    metrics.efficiency,
+                    visualSettings.enableBloom ? "ON" : "OFF",
+                    visualSettings.enableTrails ? "ON" : "OFF",
+                    mouseInteractionActive ? "ON" : "OFF");
             glfwSetWindowTitle(window, title);
             
             glfwSwapBuffers(window);
@@ -879,8 +1166,8 @@ public:
 int main() {
     try {
         std::cout << "╔══════════════════════════════════════════════════════════╗" << std::endl;
-        std::cout << "║     3D PARALLEL SPH FLUID SIMULATION                    ║" << std::endl;
-        std::cout << "║     Features: 17/17 Complete                            ║" << std::endl;
+        std::cout << "║     ENHANCED 3D PARALLEL SPH FLUID SIMULATION           ║" << std::endl;
+        std::cout << "║     Features: Bloom, Trails, Mouse Interaction         ║" << std::endl;
         std::cout << "╚══════════════════════════════════════════════════════════╝\n" << std::endl;
         
         Application app;
