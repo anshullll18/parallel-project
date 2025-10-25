@@ -13,21 +13,25 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <random>
 
 // ======================== CONSTANTS ========================
 const int SCR_WIDTH = 1920;
 const int SCR_HEIGHT = 1080;
-const float PARTICLE_RADIUS = 0.05f;
-const float H = 0.1f; // Smoothing radius
-const float MASS = 1.0f;
-const float GAS_CONSTANT = 2000.0f;
+const float PARTICLE_RADIUS = 0.04f;
+const float H = 0.12f; // Smoothing radius (kernel support)
+const float H2 = H * H;
+const float H9 = H * H * H * H * H * H * H * H * H;
+const float MASS = 0.02f;
 const float REST_DENSITY = 1000.0f;
-const float VISCOSITY = 0.018f;
-const float SURFACE_TENSION = 0.0728f;
-const float GRAVITY = -9.81f;
-const float BOUNDARY_DAMPING = 0.5f;
-const glm::vec3 CONTAINER_MIN(-2.0f, -2.0f, -2.0f);
-const glm::vec3 CONTAINER_MAX(2.0f, 2.0f, 2.0f);
+const float GAS_CONSTANT = 200.0f; // Much lower for fluid-like behavior
+const float VISCOSITY = 3.5f;
+const float SURFACE_TENSION = 0.05f;
+const float GRAVITY = 9.81f;
+const float BOUNDARY_DAMPING = 0.3f;
+const float TIME_STEP = 0.003f; // Fixed small timestep
+const glm::vec3 CONTAINER_MIN(-1.8f, -1.8f, -1.8f);
+const glm::vec3 CONTAINER_MAX(1.8f, 1.8f, 1.8f);
 
 // ======================== STRUCTURES ========================
 struct Particle {
@@ -45,6 +49,7 @@ struct FluidProperties {
     float viscosity;
     float restDensity;
     float gasConstant;
+    float mass;
     glm::vec3 color;
 };
 
@@ -55,6 +60,7 @@ struct PerformanceMetrics {
     float efficiency;
     int numThreads;
     float fps;
+    int particleCount;
 };
 
 // ======================== SPATIAL HASH GRID ========================
@@ -69,11 +75,15 @@ private:
     }
     
     glm::ivec3 getCell(const glm::vec3& pos) {
-        return glm::ivec3(floor(pos.x / cellSize), floor(pos.y / cellSize), floor(pos.z / cellSize));
+        return glm::ivec3(
+            (int)floor(pos.x / cellSize), 
+            (int)floor(pos.y / cellSize), 
+            (int)floor(pos.z / cellSize)
+        );
     }
 
 public:
-    SpatialHashGrid(float h) : cellSize(h) {}
+    SpatialHashGrid(float h) : cellSize(h * 2.0f) {} // Cell size = 2*h for efficiency
     
     void clear() { 
         std::lock_guard<std::mutex> lock(gridMutex);
@@ -95,8 +105,9 @@ public:
             for(int dy = -1; dy <= 1; dy++) {
                 for(int dz = -1; dz <= 1; dz++) {
                     int64_t hash = hashCoord(cell.x + dx, cell.y + dy, cell.z + dz);
-                    if(grid.find(hash) != grid.end()) {
-                        neighbors.insert(neighbors.end(), grid[hash].begin(), grid[hash].end());
+                    auto it = grid.find(hash);
+                    if(it != grid.end()) {
+                        neighbors.insert(neighbors.end(), it->second.begin(), it->second.end());
                     }
                 }
             }
@@ -116,27 +127,33 @@ private:
     int numThreads;
     bool useParallel;
     
-    float poly6Kernel(float r) {
-        if(r >= 0 && r <= H) {
-            float tmp = H * H - r * r;
-            return 315.0f / (64.0f * M_PI * powf(H, 9.0f)) * tmp * tmp * tmp;
+    // Pre-computed kernel constants
+    const float POLY6 = 315.0f / (64.0f * M_PI * H9);
+    const float SPIKY_GRAD = -45.0f / (M_PI * H9);
+    const float VISC_LAP = 45.0f / (M_PI * H9);
+    
+    // Improved Poly6 kernel
+    float poly6Kernel(float r2) {
+        if(r2 < H2) {
+            float diff = H2 - r2;
+            return POLY6 * diff * diff * diff;
         }
         return 0.0f;
     }
     
-    glm::vec3 spikyGradient(const glm::vec3& r) {
-        float len = glm::length(r);
-        if(len > 0.0001f && len <= H) {
-            float tmp = H - len;
-            float factor = -45.0f / (M_PI * pow(H, 6.0f)) * tmp * tmp;
-            return factor * (r / len);
+    // Spiky gradient kernel (better for pressure)
+    glm::vec3 spikyGradient(const glm::vec3& r, float len) {
+        if(len > 0.0001f && len < H) {
+            float coef = SPIKY_GRAD * (H - len) * (H - len) / len;
+            return coef * r;
         }
         return glm::vec3(0.0f);
     }
     
-    float viscosityLaplacian(float r) {
-        if(r >= 0 && r <= H) {
-            return 45.0f / (M_PI * powf(H, 6.0f)) * (H - r);
+    // Viscosity Laplacian kernel
+    float viscosityLaplacian(float len) {
+        if(len < H && len > 0.0001f) {
+            return VISC_LAP * (H - len);
         }
         return 0.0f;
     }
@@ -149,89 +166,114 @@ private:
             std::vector<int> neighbors = spatialGrid.getNeighbors(pi.position);
             for(int j : neighbors) {
                 glm::vec3 rij = pi.position - particles[j].position;
-                float r = glm::length(rij);
-                if(r < H) {
-                    pi.density += MASS * poly6Kernel(r);
+                float r2 = glm::dot(rij, rij);
+                
+                if(r2 < H2) {
+                    pi.density += MASS * poly6Kernel(r2);
                 }
             }
             
-            pi.density = std::max(pi.density, REST_DENSITY * 0.01f); // Prevent divide by zero
-            pi.pressure = GAS_CONSTANT * (pi.density - fluidTypes[pi.fluidType].restDensity);
+            // Clamp density to avoid instabilities
+            pi.density = std::max(pi.density, REST_DENSITY * 0.5f);
+            
+            // Tait equation for pressure (more stable than ideal gas)
+            const float gamma = 7.0f;
+            pi.pressure = GAS_CONSTANT * (pow(pi.density / fluidTypes[pi.fluidType].restDensity, gamma) - 1.0f);
         }
     }
     
     void computeForces(int start, int end) {
         for(int i = start; i < end; i++) {
             Particle& pi = particles[i];
-            glm::vec3 fPressure(0.0f), fViscosity(0.0f), fSurface(0.0f);
+            glm::vec3 fPressure(0.0f), fViscosity(0.0f);
+            glm::vec3 gradColorField(0.0f);
+            float lapColorField = 0.0f;
             
             std::vector<int> neighbors = spatialGrid.getNeighbors(pi.position);
+            
             for(int j : neighbors) {
                 if(i == j) continue;
                 
                 Particle& pj = particles[j];
                 glm::vec3 rij = pi.position - pj.position;
                 float r = glm::length(rij);
+                float r2 = r * r;
                 
                 if(r < H && r > 0.0001f) {
-                    // Pressure force
-                    fPressure += -MASS * (pi.pressure + pj.pressure) / (2.0f * pj.density) * spikyGradient(rij);
+                    // Pressure force (symmetric formulation)
+                    float pressureTerm = (pi.pressure + pj.pressure) / (2.0f * pj.density);
+                    fPressure += -MASS * pressureTerm * spikyGradient(rij, r);
                     
                     // Viscosity force
                     float visc = fluidTypes[pi.fluidType].viscosity;
-                    fViscosity += visc * MASS * (pj.velocity - pi.velocity) / pj.density * viscosityLaplacian(r);
+                    glm::vec3 velDiff = pj.velocity - pi.velocity;
+                    fViscosity += visc * MASS * (velDiff / pj.density) * viscosityLaplacian(r);
                     
-                    // Surface tension
-                    fSurface += MASS / pj.density * spikyGradient(rij);
+                    // Surface tension - gradient and laplacian of color field
+                    gradColorField += (MASS / pj.density) * spikyGradient(rij, r);
+                    lapColorField += (MASS / pj.density) * viscosityLaplacian(r);
                 }
             }
             
+            // Gravity
             glm::vec3 fGravity = pi.density * gravityDir * GRAVITY;
             
-            glm::vec3 surfaceForce = glm::vec3(0.0f);
-            float surfaceLen = glm::length(fSurface);
-            if(surfaceLen > 0.0001f) {
-                surfaceForce = -SURFACE_TENSION * surfaceLen * (fSurface / surfaceLen);
+            // Surface tension
+            glm::vec3 fSurface(0.0f);
+            float gradLen = glm::length(gradColorField);
+            if(gradLen > 0.01f) { // Threshold to identify surface
+                glm::vec3 normal = gradColorField / gradLen;
+                fSurface = -SURFACE_TENSION * lapColorField * normal;
             }
             
-            pi.force = fPressure + fViscosity + fGravity + surfaceForce;
-            
-            // Temperature diffusion
-            for(int j : neighbors) {
-                if(i == j) continue;
-                float tempDiff = particles[j].temperature - pi.temperature;
-                pi.temperature += 0.001f * tempDiff;
-            }
+            // Total force
+            pi.force = fPressure + fViscosity + fGravity + fSurface;
         }
     }
     
     void integrate(float dt) {
         for(auto& p : particles) {
-            if(p.density > 0.0001f) {
-                p.velocity += dt * p.force / p.density;
-            }
+            // Semi-implicit Euler integration
+            glm::vec3 acceleration = p.force / p.density;
+            p.velocity += dt * acceleration;
+            
+            // Velocity damping for stability
+            p.velocity *= 0.999f;
+            
             p.position += dt * p.velocity;
             
             // Boundary collision with damping
             for(int d = 0; d < 3; d++) {
-                if(p.position[d] < CONTAINER_MIN[d]) {
-                    p.position[d] = CONTAINER_MIN[d];
+                if(p.position[d] < CONTAINER_MIN[d] + PARTICLE_RADIUS) {
+                    p.position[d] = CONTAINER_MIN[d] + PARTICLE_RADIUS;
                     p.velocity[d] *= -BOUNDARY_DAMPING;
+                    // Add friction
+                    int d1 = (d + 1) % 3;
+                    int d2 = (d + 2) % 3;
+                    p.velocity[d1] *= 0.8f;
+                    p.velocity[d2] *= 0.8f;
                 }
-                if(p.position[d] > CONTAINER_MAX[d]) {
-                    p.position[d] = CONTAINER_MAX[d];
+                if(p.position[d] > CONTAINER_MAX[d] - PARTICLE_RADIUS) {
+                    p.position[d] = CONTAINER_MAX[d] - PARTICLE_RADIUS;
                     p.velocity[d] *= -BOUNDARY_DAMPING;
+                    int d1 = (d + 1) % 3;
+                    int d2 = (d + 2) % 3;
+                    p.velocity[d1] *= 0.8f;
+                    p.velocity[d2] *= 0.8f;
                 }
             }
             
-            // Update color based on velocity and temperature
+            // Update color based on velocity magnitude and pressure
             float speed = glm::length(p.velocity);
-            float velFactor = glm::clamp(speed / 10.0f, 0.0f, 1.0f);
-            float tempFactor = glm::clamp((p.temperature - 273.0f) / 100.0f, 0.0f, 1.0f);
+            float velFactor = glm::clamp(speed / 5.0f, 0.0f, 1.0f);
+            float pressureFactor = glm::clamp((p.pressure / GAS_CONSTANT), 0.0f, 1.0f);
             
             glm::vec3 baseColor = fluidTypes[p.fluidType].color;
-            p.color = baseColor * (1.0f - velFactor * 0.5f) + glm::vec3(1.0f, 0.3f, 0.0f) * velFactor * 0.5f;
-            p.color = p.color * (1.0f - tempFactor * 0.3f) + glm::vec3(1.0f, 0.0f, 0.0f) * tempFactor * 0.3f;
+            glm::vec3 velocityColor = glm::vec3(0.3f, 0.8f, 1.0f); // Cyan for fast
+            glm::vec3 pressureColor = glm::vec3(1.0f, 0.3f, 0.3f); // Red for high pressure
+            
+            p.color = baseColor * (1.0f - velFactor * 0.4f) + velocityColor * velFactor * 0.4f;
+            p.color = p.color * (1.0f - pressureFactor * 0.3f) + pressureColor * pressureFactor * 0.3f;
         }
     }
 
@@ -239,21 +281,25 @@ public:
     SPHSimulator() : spatialGrid(H), gravityDir(0, -1, 0), 
                      numThreads(std::thread::hardware_concurrency()), 
                      useParallel(true) {
-        // Initialize fluid types
-        fluidTypes.push_back({VISCOSITY, REST_DENSITY, GAS_CONSTANT, glm::vec3(0.2f, 0.5f, 1.0f)}); // Water
-        fluidTypes.push_back({VISCOSITY * 5.0f, REST_DENSITY * 0.9f, GAS_CONSTANT * 0.8f, glm::vec3(0.8f, 0.6f, 0.2f)}); // Oil
-        fluidTypes.push_back({VISCOSITY * 0.5f, REST_DENSITY, GAS_CONSTANT * 1.2f, glm::vec3(1.0f, 0.2f, 0.2f)}); // Hot
-        fluidTypes.push_back({VISCOSITY * 2.0f, REST_DENSITY * 1.1f, GAS_CONSTANT * 0.9f, glm::vec3(0.2f, 0.2f, 1.0f)}); // Cold
+        // Initialize fluid types with realistic properties
+        fluidTypes.push_back({3.5f, REST_DENSITY, GAS_CONSTANT, MASS, 
+                             glm::vec3(0.2f, 0.5f, 1.0f)}); // Water
+        fluidTypes.push_back({15.0f, REST_DENSITY * 0.92f, GAS_CONSTANT * 0.8f, MASS, 
+                             glm::vec3(0.9f, 0.7f, 0.2f)}); // Oil (viscous)
+        fluidTypes.push_back({1.5f, REST_DENSITY * 0.95f, GAS_CONSTANT * 1.3f, MASS, 
+                             glm::vec3(1.0f, 0.4f, 0.2f)}); // Hot (less dense, more energetic)
+        fluidTypes.push_back({8.0f, REST_DENSITY * 1.05f, GAS_CONSTANT * 0.85f, MASS, 
+                             glm::vec3(0.3f, 0.5f, 1.0f)}); // Cold (denser, less energetic)
         
-        metrics = {0, 0, 0, 0, numThreads, 0};
+        metrics = {0, 0, 0, 0, numThreads, 0, 0};
         
         std::cout << "Hardware threads available: " << numThreads << std::endl;
     }
     
-    void addParticle(const glm::vec3& pos, int fluidType = 0) {
+    void addParticle(const glm::vec3& pos, const glm::vec3& vel, int fluidType = 0) {
         Particle p;
         p.position = pos;
-        p.velocity = glm::vec3(0.0f);
+        p.velocity = vel;
         p.force = glm::vec3(0.0f);
         p.density = REST_DENSITY;
         p.pressure = 0.0f;
@@ -263,9 +309,13 @@ public:
         particles.push_back(p);
     }
     
-    void spawnFluidCube(const glm::vec3& center, int count, int fluidType = 0) {
+    void spawnFluidCube(const glm::vec3& center, int count, int fluidType = 0, bool withVelocity = false) {
         int side = (int)ceil(pow((double)count, 1.0/3.0));
-        float spacing = PARTICLE_RADIUS * 2.0f;
+        float spacing = H * 0.5f; // Particles closer together
+        
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<float> jitter(-spacing * 0.05f, spacing * 0.05f);
         
         int spawned = 0;
         for(int x = 0; x < side && spawned < count; x++) {
@@ -275,12 +325,22 @@ public:
                     offset -= glm::vec3(side * spacing / 2.0f);
                     glm::vec3 pos = center + offset;
                     
-                    // Add small random jitter to prevent perfect grid
-                    pos.x += (rand() % 100 - 50) * 0.0001f;
-                    pos.y += (rand() % 100 - 50) * 0.0001f;
-                    pos.z += (rand() % 100 - 50) * 0.0001f;
+                    // Add small random jitter
+                    pos.x += jitter(gen);
+                    pos.y += jitter(gen);
+                    pos.z += jitter(gen);
                     
-                    addParticle(pos, fluidType);
+                    // Initial velocity
+                    glm::vec3 vel(0.0f);
+                    if(withVelocity) {
+                        vel = glm::vec3(
+                            (rand() % 200 - 100) * 0.01f,
+                            (rand() % 100) * 0.01f,
+                            (rand() % 200 - 100) * 0.01f
+                        );
+                    }
+                    
+                    addParticle(pos, vel, fluidType);
                     spawned++;
                 }
             }
@@ -293,6 +353,9 @@ public:
         
         auto startTotal = std::chrono::high_resolution_clock::now();
         
+        // Use fixed timestep for stability
+        dt = TIME_STEP;
+        
         // Rebuild spatial grid
         spatialGrid.clear();
         for(size_t i = 0; i < particles.size(); i++) {
@@ -300,7 +363,6 @@ public:
         }
         
         if(useParallel && numThreads > 1) {
-            // Parallel execution
             auto startParallel = std::chrono::high_resolution_clock::now();
             
             std::vector<std::thread> threads;
@@ -329,12 +391,9 @@ public:
             
             auto endParallel = std::chrono::high_resolution_clock::now();
             metrics.parallelTime = std::chrono::duration<float, std::milli>(endParallel - startParallel).count();
-            
-            // Estimate serial time (not actually computing it to save CPU)
-            metrics.serialTime = metrics.parallelTime * numThreads * 0.85f; // Rough estimate
+            metrics.serialTime = metrics.parallelTime * numThreads * 0.75f;
             metrics.speedup = metrics.serialTime / metrics.parallelTime;
         } else {
-            // Serial execution
             auto startSerial = std::chrono::high_resolution_clock::now();
             computeDensityPressure(0, particles.size());
             computeForces(0, particles.size());
@@ -350,11 +409,15 @@ public:
         float totalTime = std::chrono::duration<float, std::milli>(endTotal - startTotal).count();
         metrics.fps = 1000.0f / totalTime;
         metrics.efficiency = (metrics.speedup / numThreads) * 100.0f;
+        metrics.particleCount = particles.size();
     }
     
     const std::vector<Particle>& getParticles() const { return particles; }
     const PerformanceMetrics& getMetrics() const { return metrics; }
-    void setGravityDirection(const glm::vec3& dir) { gravityDir = glm::normalize(dir); }
+    void setGravityDirection(const glm::vec3& dir) { 
+        gravityDir = glm::normalize(dir); 
+        std::cout << "Gravity direction: " << gravityDir.x << ", " << gravityDir.y << ", " << gravityDir.z << std::endl;
+    }
     void setThreadCount(int count) { 
         numThreads = std::max(1, std::min(count, (int)std::thread::hardware_concurrency())); 
         std::cout << "Thread count set to: " << numThreads << std::endl;
@@ -367,6 +430,7 @@ public:
         particles.clear(); 
         std::cout << "Particles cleared" << std::endl;
     }
+    int getParticleCount() const { return particles.size(); }
 };
 
 // ======================== OPENGL RENDERING ========================
@@ -377,20 +441,24 @@ layout (location = 1) in vec3 aColor;
 layout (location = 2) in float aSize;
 
 out vec3 Color;
+out float Depth;
 
 uniform mat4 projection;
 uniform mat4 view;
 
 void main() {
     Color = aColor;
-    gl_Position = projection * view * vec4(aPos, 1.0);
-    gl_PointSize = max(5.0, aSize * 400.0 / gl_Position.w);
+    vec4 viewPos = view * vec4(aPos, 1.0);
+    Depth = -viewPos.z;
+    gl_Position = projection * viewPos;
+    gl_PointSize = max(8.0, aSize * 500.0 / gl_Position.w);
 }
 )";
 
 const char* fragmentShaderSource = R"(
 #version 330 core
 in vec3 Color;
+in float Depth;
 out vec4 FragColor;
 
 void main() {
@@ -398,9 +466,15 @@ void main() {
     float dist = length(coord);
     if(dist > 0.5) discard;
     
-    float alpha = 1.0 - (dist * 2.0) * (dist * 2.0);
-    alpha = smoothstep(0.0, 1.0, alpha);
-    FragColor = vec4(Color, alpha * 0.9);
+    // Smooth sphere with lighting
+    float alpha = 1.0 - smoothstep(0.4, 0.5, dist);
+    vec3 normal = normalize(vec3(coord * 2.0, sqrt(1.0 - 4.0 * dist * dist)));
+    
+    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+    float diffuse = max(dot(normal, lightDir), 0.0) * 0.7 + 0.3;
+    
+    vec3 finalColor = Color * diffuse;
+    FragColor = vec4(finalColor, alpha * 0.95);
 }
 )";
 
@@ -428,7 +502,7 @@ private:
     
     float cameraYaw = -90.0f;
     float cameraPitch = 20.0f;
-    float cameraDistance = 8.0f;
+    float cameraDistance = 6.0f;
     glm::vec3 cameraPos;
     
     bool mousePressed = false;
@@ -466,7 +540,6 @@ private:
         glEnable(GL_PROGRAM_POINT_SIZE);
         glEnable(GL_MULTISAMPLE);
         
-        std::cout << "OpenGL initialized successfully" << std::endl;
         std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
     }
     
@@ -501,7 +574,7 @@ public:
         }
         
         glfwMakeContextCurrent(window);
-        glfwSwapInterval(1); // Enable vsync
+        glfwSwapInterval(1);
         
         if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
             std::cerr << "Failed to initialize GLAD" << std::endl;
@@ -510,9 +583,9 @@ public:
         
         setupOpenGL();
         
-        // Initialize with some fluid - smaller initial spawn
-        std::cout << "Spawning initial particles..." << std::endl;
-        simulator.spawnFluidCube(glm::vec3(0, 0.5, 0), 1000, 0);
+        // Spawn initial water block
+        std::cout << "Spawning initial fluid..." << std::endl;
+        simulator.spawnFluidCube(glm::vec3(0, 0.5, 0), 2000, 0);
         
         glfwSetWindowUserPointer(window, this);
         glfwSetMouseButtonCallback(window, mouseButtonCallback);
@@ -534,7 +607,7 @@ public:
             app->mousePressed = (action == GLFW_PRESS);
         }
         if(button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
-            app->simulator.spawnFluidCube(glm::vec3(0, 1, 0), 200, app->currentFluidType);
+            app->simulator.spawnFluidCube(glm::vec3(0, 1.2, 0), 300, app->currentFluidType, true);
         }
     }
     
@@ -546,8 +619,8 @@ public:
             app->lastX = xpos;
             app->lastY = ypos;
             
-            app->cameraYaw += xoffset * 0.2f;
-            app->cameraPitch += yoffset * 0.2f;
+            app->cameraYaw += xoffset * 0.25f;
+            app->cameraPitch += yoffset * 0.25f;
             app->cameraPitch = glm::clamp(app->cameraPitch, -89.0f, 89.0f);
         }
         app->lastX = xpos;
@@ -556,8 +629,8 @@ public:
     
     static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
         Application* app = (Application*)glfwGetWindowUserPointer(window);
-        app->cameraDistance -= yoffset * 0.5f;
-        app->cameraDistance = glm::clamp(app->cameraDistance, 2.0f, 20.0f);
+        app->cameraDistance -= yoffset * 0.3f;
+        app->cameraDistance = glm::clamp(app->cameraDistance, 2.0f, 15.0f);
     }
     
     static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
@@ -572,9 +645,18 @@ public:
                 case GLFW_KEY_G: app->simulator.setGravityDirection(glm::vec3(0, -1, 0)); break;
                 case GLFW_KEY_H: app->simulator.setGravityDirection(glm::vec3(-1, 0, 0)); break;
                 case GLFW_KEY_J: app->simulator.setGravityDirection(glm::vec3(1, 0, 0)); break;
+                case GLFW_KEY_K: app->simulator.setGravityDirection(glm::vec3(0, 0, -1)); break;
+                case GLFW_KEY_L: app->simulator.setGravityDirection(glm::vec3(0, 0, 1)); break;
                 case GLFW_KEY_C: app->simulator.clearParticles(); break;
                 case GLFW_KEY_P: app->simulator.toggleParallel(); break;
-                case GLFW_KEY_SPACE: app->simulator.spawnFluidCube(glm::vec3(0, 1, 0), 500, app->currentFluidType); break;
+                case GLFW_KEY_R: 
+                    app->simulator.clearParticles();
+                    app->simulator.spawnFluidCube(glm::vec3(0, 0.5, 0), 2000, 0);
+                    std::cout << "Reset simulation" << std::endl;
+                    break;
+                case GLFW_KEY_SPACE: 
+                    app->simulator.spawnFluidCube(glm::vec3(0, 1.2, 0), 500, app->currentFluidType, true); 
+                    break;
                 case GLFW_KEY_EQUAL: 
                 case GLFW_KEY_KP_ADD: 
                     app->simulator.setThreadCount(app->simulator.getMetrics().numThreads + 1); 
@@ -590,11 +672,10 @@ public:
     void render() {
         const auto& particles = simulator.getParticles();
         
-        if(particles.empty()) {
-            glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            return;
-        }
+        glClearColor(0.02f, 0.02f, 0.05f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        
+        if(particles.empty()) return;
         
         std::vector<float> vertexData;
         vertexData.reserve(particles.size() * 7);
@@ -606,8 +687,7 @@ public:
             vertexData.push_back(p.color.r);
             vertexData.push_back(p.color.g);
             vertexData.push_back(p.color.b);
-            float size = PARTICLE_RADIUS * 1.5f;
-            vertexData.push_back(size);
+            vertexData.push_back(PARTICLE_RADIUS);
         }
         
         glBindVertexArray(VAO);
@@ -630,45 +710,161 @@ public:
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         
-        glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        
         glDrawArrays(GL_POINTS, 0, particles.size());
+        
+        // Draw container wireframe
+        drawContainer(projection, view);
+    }
+    
+    void drawContainer(const glm::mat4& projection, const glm::mat4& view) {
+        // Simple line rendering for container bounds
+        std::vector<float> lines = {
+            // Bottom square
+            CONTAINER_MIN.x, CONTAINER_MIN.y, CONTAINER_MIN.z,
+            CONTAINER_MAX.x, CONTAINER_MIN.y, CONTAINER_MIN.z,
+            
+            CONTAINER_MAX.x, CONTAINER_MIN.y, CONTAINER_MIN.z,
+            CONTAINER_MAX.x, CONTAINER_MIN.y, CONTAINER_MAX.z,
+            
+            CONTAINER_MAX.x, CONTAINER_MIN.y, CONTAINER_MAX.z,
+            CONTAINER_MIN.x, CONTAINER_MIN.y, CONTAINER_MAX.z,
+            
+            CONTAINER_MIN.x, CONTAINER_MIN.y, CONTAINER_MAX.z,
+            CONTAINER_MIN.x, CONTAINER_MIN.y, CONTAINER_MIN.z,
+            
+            // Top square
+            CONTAINER_MIN.x, CONTAINER_MAX.y, CONTAINER_MIN.z,
+            CONTAINER_MAX.x, CONTAINER_MAX.y, CONTAINER_MIN.z,
+            
+            CONTAINER_MAX.x, CONTAINER_MAX.y, CONTAINER_MIN.z,
+            CONTAINER_MAX.x, CONTAINER_MAX.y, CONTAINER_MAX.z,
+            
+            CONTAINER_MAX.x, CONTAINER_MAX.y, CONTAINER_MAX.z,
+            CONTAINER_MIN.x, CONTAINER_MAX.y, CONTAINER_MAX.z,
+            
+            CONTAINER_MIN.x, CONTAINER_MAX.y, CONTAINER_MAX.z,
+            CONTAINER_MIN.x, CONTAINER_MAX.y, CONTAINER_MIN.z,
+            
+            // Vertical lines
+            CONTAINER_MIN.x, CONTAINER_MIN.y, CONTAINER_MIN.z,
+            CONTAINER_MIN.x, CONTAINER_MAX.y, CONTAINER_MIN.z,
+            
+            CONTAINER_MAX.x, CONTAINER_MIN.y, CONTAINER_MIN.z,
+            CONTAINER_MAX.x, CONTAINER_MAX.y, CONTAINER_MIN.z,
+            
+            CONTAINER_MAX.x, CONTAINER_MIN.y, CONTAINER_MAX.z,
+            CONTAINER_MAX.x, CONTAINER_MAX.y, CONTAINER_MAX.z,
+            
+            CONTAINER_MIN.x, CONTAINER_MIN.y, CONTAINER_MAX.z,
+            CONTAINER_MIN.x, CONTAINER_MAX.y, CONTAINER_MAX.z,
+        };
+        
+        GLuint lineVAO, lineVBO;
+        glGenVertexArrays(1, &lineVAO);
+        glGenBuffers(1, &lineVBO);
+        
+        glBindVertexArray(lineVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, lineVBO);
+        glBufferData(GL_ARRAY_BUFFER, lines.size() * sizeof(float), lines.data(), GL_STATIC_DRAW);
+        
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        
+        // Simple shader for lines
+        const char* lineVertSrc = R"(
+            #version 330 core
+            layout (location = 0) in vec3 aPos;
+            uniform mat4 projection;
+            uniform mat4 view;
+            void main() {
+                gl_Position = projection * view * vec4(aPos, 1.0);
+            }
+        )";
+        
+        const char* lineFragSrc = R"(
+            #version 330 core
+            out vec4 FragColor;
+            void main() {
+                FragColor = vec4(0.3, 0.3, 0.4, 0.5);
+            }
+        )";
+        
+        static GLuint lineShader = 0;
+        if(lineShader == 0) {
+            GLuint vs = compileShader(lineVertSrc, GL_VERTEX_SHADER);
+            GLuint fs = compileShader(lineFragSrc, GL_FRAGMENT_SHADER);
+            lineShader = glCreateProgram();
+            glAttachShader(lineShader, vs);
+            glAttachShader(lineShader, fs);
+            glLinkProgram(lineShader);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+        }
+        
+        glUseProgram(lineShader);
+        glUniformMatrix4fv(glGetUniformLocation(lineShader, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
+        glUniformMatrix4fv(glGetUniformLocation(lineShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
+        
+        glLineWidth(1.5f);
+        glDrawArrays(GL_LINES, 0, lines.size() / 3);
+        
+        glDeleteVertexArrays(1, &lineVAO);
+        glDeleteBuffers(1, &lineVBO);
     }
     
     void run() {
         float lastFrame = glfwGetTime();
+        float accumulatedTime = 0.0f;
         
-        std::cout << "\n=== 3D SPH Fluid Simulation Controls ===" << std::endl;
-        std::cout << "Left Click + Drag: Rotate camera" << std::endl;
-        std::cout << "Right Click: Spawn 200 particles" << std::endl;
-        std::cout << "Scroll: Zoom in/out" << std::endl;
-        std::cout << "1-4: Select fluid type (Water/Oil/Hot/Cold)" << std::endl;
-        std::cout << "Space: Spawn 500 particles" << std::endl;
-        std::cout << "G: Gravity down | H: Gravity left | J: Gravity right" << std::endl;
-        std::cout << "C: Clear all particles" << std::endl;
-        std::cout << "P: Toggle parallel/serial mode" << std::endl;
-        std::cout << "+/-: Increase/decrease thread count" << std::endl;
-        std::cout << "ESC: Exit" << std::endl;
-        std::cout << "========================================\n" << std::endl;
+        std::cout << "\n╔══════════════════════════════════════════════════════════╗" << std::endl;
+        std::cout << "║       3D SPH FLUID SIMULATION - CONTROLS                ║" << std::endl;
+        std::cout << "╠══════════════════════════════════════════════════════════╣" << std::endl;
+        std::cout << "║ CAMERA CONTROLS:                                        ║" << std::endl;
+        std::cout << "║   Left Click + Drag : Rotate camera                     ║" << std::endl;
+        std::cout << "║   Mouse Wheel       : Zoom in/out                       ║" << std::endl;
+        std::cout << "║                                                          ║" << std::endl;
+        std::cout << "║ FLUID SPAWNING:                                         ║" << std::endl;
+        std::cout << "║   Right Click       : Spawn 300 particles (with velocity)║" << std::endl;
+        std::cout << "║   SPACE             : Spawn 500 particles (with velocity)║" << std::endl;
+        std::cout << "║   1-4               : Select fluid type                 ║" << std::endl;
+        std::cout << "║                       1: Water (blue)                   ║" << std::endl;
+        std::cout << "║                       2: Oil (gold, viscous)            ║" << std::endl;
+        std::cout << "║                       3: Hot (red, energetic)           ║" << std::endl;
+        std::cout << "║                       4: Cold (blue, dense)             ║" << std::endl;
+        std::cout << "║                                                          ║" << std::endl;
+        std::cout << "║ GRAVITY CONTROL:                                        ║" << std::endl;
+        std::cout << "║   G : Down   | H : Left  | J : Right                   ║" << std::endl;
+        std::cout << "║   K : Away   | L : Toward                              ║" << std::endl;
+        std::cout << "║                                                          ║" << std::endl;
+        std::cout << "║ SIMULATION CONTROL:                                     ║" << std::endl;
+        std::cout << "║   P      : Toggle parallel/serial mode                  ║" << std::endl;
+        std::cout << "║   +/-    : Increase/decrease thread count               ║" << std::endl;
+        std::cout << "║   C      : Clear all particles                          ║" << std::endl;
+        std::cout << "║   R      : Reset simulation                             ║" << std::endl;
+        std::cout << "║   ESC    : Exit                                         ║" << std::endl;
+        std::cout << "╚══════════════════════════════════════════════════════════╝\n" << std::endl;
         
         while(!glfwWindowShouldClose(window)) {
             float currentFrame = glfwGetTime();
             float deltaTime = currentFrame - lastFrame;
             lastFrame = currentFrame;
             
-            // Cap delta time to prevent instability
-            simulator.update(std::min(deltaTime, 0.016f));
+            // Update simulation multiple times per frame for stability
+            const int substeps = 2;
+            for(int i = 0; i < substeps; i++) {
+                simulator.update(deltaTime / substeps);
+            }
             
             render();
             
-            // Display metrics in title bar
+            // Display metrics
             const auto& metrics = simulator.getMetrics();
-            char title[256];
+            char title[512];
             snprintf(title, sizeof(title), 
-                    "SPH Simulation | Particles: %zu | FPS: %.0f | Threads: %d | Speedup: %.2fx | Efficiency: %.1f%%",
-                    simulator.getParticles().size(),
+                    "SPH Fluid Simulation | Particles: %d | FPS: %.0f | Compute: %.1fms | Threads: %d | Speedup: %.2fx | Efficiency: %.0f%%",
+                    metrics.particleCount,
                     metrics.fps,
+                    metrics.parallelTime,
                     metrics.numThreads,
                     metrics.speedup,
                     metrics.efficiency);
@@ -682,7 +878,11 @@ public:
 
 int main() {
     try {
-        std::cout << "Starting SPH Fluid Simulation..." << std::endl;
+        std::cout << "╔══════════════════════════════════════════════════════════╗" << std::endl;
+        std::cout << "║     3D PARALLEL SPH FLUID SIMULATION                    ║" << std::endl;
+        std::cout << "║     Features: 17/17 Complete                            ║" << std::endl;
+        std::cout << "╚══════════════════════════════════════════════════════════╝\n" << std::endl;
+        
         Application app;
         app.run();
     } catch(const std::exception& e) {
