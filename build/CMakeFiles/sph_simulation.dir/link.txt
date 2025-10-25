@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -march=native -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/sph_simulation.dir/src/main.cpp.o CMakeFiles/sph_simulation.dir/src/glad.c.o -o sph_simulation  -Wl,-rpath,/opt/homebrew/lib /opt/homebrew/lib/libglfw.3.4.dylib -framework OpenGL -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo

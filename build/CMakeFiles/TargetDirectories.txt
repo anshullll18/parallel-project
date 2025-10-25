@@ -1,0 +1,7 @@
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/sph_simulation.dir
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/edit_cache.dir
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/rebuild_cache.dir
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/list_install_components.dir
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/install.dir
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/install/local.dir
+/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles/install/strip.dir
