@@ -26,7 +26,7 @@ include_directories(
 
 # Source files
 set(SOURCES
-    src/main.cpp
+    src/main_research.cpp
     src/glad.c
 )
 

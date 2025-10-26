@@ -72,19 +72,19 @@ include CMakeFiles/sph_simulation.dir/flags.make
 CMakeFiles/sph_simulation.dir/codegen:
 .PHONY : CMakeFiles/sph_simulation.dir/codegen
 
-CMakeFiles/sph_simulation.dir/src/main.cpp.o: CMakeFiles/sph_simulation.dir/flags.make
-CMakeFiles/sph_simulation.dir/src/main.cpp.o: /Users/anshuldadhich/Desktop/codes/paralle-project/src/main.cpp
-CMakeFiles/sph_simulation.dir/src/main.cpp.o: CMakeFiles/sph_simulation.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/sph_simulation.dir/src/main.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/sph_simulation.dir/src/main.cpp.o -MF CMakeFiles/sph_simulation.dir/src/main.cpp.o.d -o CMakeFiles/sph_simulation.dir/src/main.cpp.o -c /Users/anshuldadhich/Desktop/codes/paralle-project/src/main.cpp
+CMakeFiles/sph_simulation.dir/src/main_research.cpp.o: CMakeFiles/sph_simulation.dir/flags.make
+CMakeFiles/sph_simulation.dir/src/main_research.cpp.o: /Users/anshuldadhich/Desktop/codes/paralle-project/src/main_research.cpp
+CMakeFiles/sph_simulation.dir/src/main_research.cpp.o: CMakeFiles/sph_simulation.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/Users/anshuldadhich/Desktop/codes/paralle-project/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/sph_simulation.dir/src/main_research.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/sph_simulation.dir/src/main_research.cpp.o -MF CMakeFiles/sph_simulation.dir/src/main_research.cpp.o.d -o CMakeFiles/sph_simulation.dir/src/main_research.cpp.o -c /Users/anshuldadhich/Desktop/codes/paralle-project/src/main_research.cpp
 
-CMakeFiles/sph_simulation.dir/src/main.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/sph_simulation.dir/src/main.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/anshuldadhich/Desktop/codes/paralle-project/src/main.cpp > CMakeFiles/sph_simulation.dir/src/main.cpp.i
+CMakeFiles/sph_simulation.dir/src/main_research.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/sph_simulation.dir/src/main_research.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /Users/anshuldadhich/Desktop/codes/paralle-project/src/main_research.cpp > CMakeFiles/sph_simulation.dir/src/main_research.cpp.i
 
-CMakeFiles/sph_simulation.dir/src/main.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/sph_simulation.dir/src/main.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/anshuldadhich/Desktop/codes/paralle-project/src/main.cpp -o CMakeFiles/sph_simulation.dir/src/main.cpp.s
+CMakeFiles/sph_simulation.dir/src/main_research.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/sph_simulation.dir/src/main_research.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /Users/anshuldadhich/Desktop/codes/paralle-project/src/main_research.cpp -o CMakeFiles/sph_simulation.dir/src/main_research.cpp.s
 
 CMakeFiles/sph_simulation.dir/src/glad.c.o: CMakeFiles/sph_simulation.dir/flags.make
 CMakeFiles/sph_simulation.dir/src/glad.c.o: /Users/anshuldadhich/Desktop/codes/paralle-project/src/glad.c
@@ -102,13 +102,13 @@ CMakeFiles/sph_simulation.dir/src/glad.c.s: cmake_force
 
 # Object files for target sph_simulation
 sph_simulation_OBJECTS = \
-"CMakeFiles/sph_simulation.dir/src/main.cpp.o" \
+"CMakeFiles/sph_simulation.dir/src/main_research.cpp.o" \
 "CMakeFiles/sph_simulation.dir/src/glad.c.o"
 
 # External object files for target sph_simulation
 sph_simulation_EXTERNAL_OBJECTS =
 
-sph_simulation: CMakeFiles/sph_simulation.dir/src/main.cpp.o
+sph_simulation: CMakeFiles/sph_simulation.dir/src/main_research.cpp.o
 sph_simulation: CMakeFiles/sph_simulation.dir/src/glad.c.o
 sph_simulation: CMakeFiles/sph_simulation.dir/build.make
 sph_simulation: /opt/homebrew/lib/libglfw.3.4.dylib

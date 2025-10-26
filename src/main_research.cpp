@@ -131,8 +131,7 @@ namespace Math {
         f = f * f * (3.0f - 2.0f * f);
         
         float n = i.x + i.y * 57.0f + i.z * 113.0f;
-        float hash = fract(sin(n) * 43758.5453f);
-        return hash * 2.0f - 1.0f;
+        float hash = glm::fract(sin(n) * 43758.5453f);        return hash * 2.0f - 1.0f;
     }
     
     inline float fract(float x) { return x - floor(x); }

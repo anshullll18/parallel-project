@@ -198,29 +198,29 @@ src/glad.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/glad.c.s
 .PHONY : src/glad.c.s
 
-src/main.o: src/main.cpp.o
-.PHONY : src/main.o
+src/main_research.o: src/main_research.cpp.o
+.PHONY : src/main_research.o
 
 # target to build an object file
-src/main.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/main.cpp.o
-.PHONY : src/main.cpp.o
+src/main_research.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/main_research.cpp.o
+.PHONY : src/main_research.cpp.o
 
-src/main.i: src/main.cpp.i
-.PHONY : src/main.i
+src/main_research.i: src/main_research.cpp.i
+.PHONY : src/main_research.i
 
 # target to preprocess a source file
-src/main.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/main.cpp.i
-.PHONY : src/main.cpp.i
+src/main_research.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/main_research.cpp.i
+.PHONY : src/main_research.cpp.i
 
-src/main.s: src/main.cpp.s
-.PHONY : src/main.s
+src/main_research.s: src/main_research.cpp.s
+.PHONY : src/main_research.s
 
 # target to generate assembly for a file
-src/main.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/main.cpp.s
-.PHONY : src/main.cpp.s
+src/main_research.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/sph_simulation.dir/build.make CMakeFiles/sph_simulation.dir/src/main_research.cpp.s
+.PHONY : src/main_research.cpp.s
 
 # Help Target
 help:
@@ -238,9 +238,9 @@ help:
 	@echo "... src/glad.o"
 	@echo "... src/glad.i"
 	@echo "... src/glad.s"
-	@echo "... src/main.o"
-	@echo "... src/main.i"
-	@echo "... src/main.s"
+	@echo "... src/main_research.o"
+	@echo "... src/main_research.i"
+	@echo "... src/main_research.s"
 .PHONY : help
 
 

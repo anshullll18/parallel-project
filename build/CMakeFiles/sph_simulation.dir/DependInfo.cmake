@@ -9,7 +9,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/anshuldadhich/Desktop/codes/paralle-project/src/glad.c" "CMakeFiles/sph_simulation.dir/src/glad.c.o" "gcc" "CMakeFiles/sph_simulation.dir/src/glad.c.o.d"
-  "/Users/anshuldadhich/Desktop/codes/paralle-project/src/main.cpp" "CMakeFiles/sph_simulation.dir/src/main.cpp.o" "gcc" "CMakeFiles/sph_simulation.dir/src/main.cpp.o.d"
+  "/Users/anshuldadhich/Desktop/codes/paralle-project/src/main_research.cpp" "CMakeFiles/sph_simulation.dir/src/main_research.cpp.o" "gcc" "CMakeFiles/sph_simulation.dir/src/main_research.cpp.o.d"
   )
 
 # Targets to which this target links which contain Fortran sources.
